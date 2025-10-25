@@ -122,12 +122,14 @@ struct ControlContext {
 	bool pc_enable;
 	bool pc_select_alu;
 	bool pc_select_pc_base;
+	bool pc_peek;
 	bool rf_write_enable;
 	bool select_addr;
 	bool select_b;
 	bool select_mem;
 	bool select_pc;
 	bool select_immediate;
+	bool select_pc_peek;
 	bool write_enable;
 	uint8_t alu_op;
 	uint32_t immediate;
@@ -148,7 +150,9 @@ private:
 		BREAK,
 		B_TYPE,
 		J_TYPE,
-		JLR_TP
+		JLR_TP,
+		AUIPC1,
+		AUIPC2,
 	};
 
 	static constexpr uint8_t OPCODE_I = 0b0010011;
@@ -162,6 +166,7 @@ private:
 	static constexpr uint8_t OPCODE_B = 0b1100011;
 	static constexpr uint8_t OPCODE_J = 0b1101111;
 	static constexpr uint8_t OPC_JALR = 0b1100111;
+	static constexpr uint8_t OP_AUIPC = 0b0010111;
 
 	ControlState state = ControlState::FETCH1;
 
@@ -224,6 +229,7 @@ public:
 			case OPCODE_B: next_state = ControlState::B_TYPE; break;
 			case OPCODE_J: next_state = ControlState::J_TYPE; break;
 			case OPC_JALR: next_state = ControlState::JLR_TP; break;
+			case OP_AUIPC: next_state = ControlState::AUIPC1; break;
 			default: next_state = ControlState::BREAK;
 			}
 			break;
@@ -232,6 +238,7 @@ public:
 		case ControlState::I_TYPE:
 		case ControlState::R_TYPE:
 		case ControlState::U_TYPE:
+		case ControlState::AUIPC2:
 			next_state = ControlState::FETCH2;
 			break;
 		case ControlState::B_TYPE:
@@ -241,6 +248,7 @@ public:
 		case ControlState::S_TYPE:
 			next_state = ControlState::FETCH1;
 			break;
+		case ControlState::AUIPC1: next_state = ControlState::AUIPC2; break;
 		default:
 			next_state = ControlState::BREAK;
 		}
@@ -302,6 +310,17 @@ public:
 			context.pc_enable = true;
 			context.pc_select_alu = true;
 			context.select_pc = true;
+			break;
+		case ControlState::AUIPC1:
+			context.immediate = imm_u_20 << 12;
+			context.pc_select_pc_base = true;
+			context.pc_add_immediate = true;
+			context.pc_peek = true;
+			break;
+		case ControlState::AUIPC2:
+			context.rf_write_enable = true;
+			context.select_pc = true;
+			context.select_pc_peek = true;
 		}
 
 		switch (opcode) {
@@ -326,6 +345,7 @@ public:
 		case OPCODE_L:
 		case OPCODE_S:
 		case OPC_JALR:
+		case OP_AUIPC:
 			context.alu_op = 0;
 			break;
 		case OPCODE_B:
@@ -362,21 +382,26 @@ private:
 	static constexpr uint32_t RESET_VECTOR = 0x80000000;
 
 	uint32_t base = RESET_VECTOR;
+	uint32_t peek_base = 0;
 
 public:
 	uint32_t Read() const {
 		return base;
 	}
 
+	uint32_t Peek() const {
+		return peek_base;
+	}
+
 	void Cycle(bool nreset, ControlContext context, uint32_t immediate, uint32_t alu_input) {
 		if (!nreset) {
 			base = RESET_VECTOR;
 		}
-		else if (context.pc_enable || (context.branch_op && (alu_input & 1))) {
+		else if (context.pc_peek || context.pc_enable || (context.branch_op && (alu_input & 1))) {
 			uint32_t next_base = base;
 
 			if (context.pc_select_alu) {
-				next_base = alu_input << 2;
+				next_base = alu_input & 0xFFFFFFFC;
 			}
 			else {
 				if (context.pc_select_pc_base) {
@@ -391,7 +416,12 @@ public:
 				}
 			}
 
-			base = next_base;
+			if (context.pc_peek) {
+				peek_base = next_base;
+			}
+			else {
+				base = next_base;
+			}
 		}
 	}
 };
@@ -520,7 +550,7 @@ public:
 		uint32_t rb = rf.Read((instruction >> 20) & 0x1F);
 
 		// Read next pc
-		uint32_t next_pc = pc.Read();
+		uint32_t next_pc = context.select_pc_peek ? pc.Peek() : pc.Read();
 
 		// select immediate or register B
 		uint32_t sel_b = context.select_b ? rb : context.immediate;
