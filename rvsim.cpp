@@ -19,30 +19,16 @@ namespace {
 
 class RegisterFile {
 private:
-	class {
-	private:
-		uint32_t registers[32] = { 0 };
-
-	public:
-		uint32_t Read(uint8_t i) const {
-			return registers[i];
-		}
-
-		void Write(uint8_t i, uint32_t v) {
-			if (i != 0) {
-				registers[i] = v;
-			}
-		}
-	} registers;
+	uint32_t registers[32] = { 0 };
 
 public:
-	uint32_t Read(uint8_t id) {
-		return registers.Read(id);
+	uint32_t Read(uint8_t i) const {
+		return registers[i];
 	}
 
-	void Cycle(uint8_t id, bool enable, uint32_t data) {
-		if (enable) {
-			registers.Write(id, data);
+	void Update(uint8_t i, uint32_t v) {
+		if (i != 0) {
+			registers[i] = v;
 		}
 	}
 };
@@ -115,44 +101,124 @@ public:
 	}
 };
 
+enum class ram_op_t : uint8_t {
+	READ32,
+	WRITE32,
+	SREAD16,
+	ZREAD16,
+	WRITE16,
+	SREAD8,
+	ZREAD8,
+	WRITE8
+};
+
 struct ControlContext {
-	bool branch_op;
-	bool ir_enable;
-	bool pc_add_immediate;
-	bool pc_enable;
-	bool pc_select_alu;
-	bool pc_select_pc_base;
-	bool pc_peek;
-	bool rf_write_enable;
-	bool select_addr;
-	bool select_b;
-	bool select_mem;
-	bool select_pc;
-	bool select_immediate;
-	bool select_pc_peek;
-	bool write_enable;
 	uint8_t alu_op;
 	uint32_t immediate;
+	ram_op_t ram_op;
+	uint32_t fast_mem_addr;
+};
+
+template<size_t N> uint32_t sign_extend(uint32_t x) {
+	union {
+		uint32_t uimm : N;
+		int32_t imm : N;
+	} s;
+
+	s.uimm = x;
+	int32_t sign_extended = s.imm;
+	return sign_extended;
+}
+
+class IR {
+private:
+	uint32_t count = 0;
+	uint32_t Q = 0;
+
+public:
+	uint32_t Read() const {
+		return Q;
+	}
+
+	void Update(uint32_t D) {
+		++count;
+		Q = D;
+	}
+
+	uint32_t QueryCount() const {
+		return count;
+	}
+};
+
+class PC {
+private:
+	static constexpr uint32_t RESET_VECTOR = 0x80000000;
+
+	uint32_t base = RESET_VECTOR;
+
+	uint32_t PrepareUpdate(bool select_base, bool add_immediate, uint32_t immediate) {
+		uint32_t next_base = base;
+
+		if (select_base) {
+			next_base -= 4;
+		}
+
+		if (add_immediate) {
+			next_base += immediate;
+		}
+		else {
+			next_base += 4;
+		}
+
+		return next_base;
+	}
+
+public:
+	uint32_t Read() const {
+		return base;
+	}
+
+	void Reset() {
+		base = RESET_VECTOR;
+	}
+
+	void UpdateALU(uint32_t alu_input) {
+		base = alu_input & 0xFFFFFFFC;
+	}
+
+	void Update(bool select_base, bool add_immediate, uint32_t immediate) {
+		base = PrepareUpdate(select_base, add_immediate, immediate);
+	}
+
+	uint32_t Peek(bool select_base, bool add_immediate, uint32_t immediate) {
+		return PrepareUpdate(select_base, add_immediate, immediate);
+	}
+};
+
+class MMU {
+private:
+	virtual uint32_t Read(uint32_t at) const = 0;
+	virtual void Write(uint32_t at, uint32_t v) const = 0;
+
+public:
+	virtual uint32_t Access(uint32_t at, uint32_t x, ram_op_t op) const = 0;
 };
 
 class ControlUnit {
 private:
-	enum class ControlState {
-		FETCH1,
-		FETCH2,
+	enum class ControlState : uint_fast32_t {
+		FETCH,
 		DECODE,
 		I_TYPE,
 		R_TYPE,
 		U_TYPE,
-		LOAD1,
-		LOAD2,
+		LOAD,
 		S_TYPE,
 		BREAK,
 		B_TYPE,
 		J_TYPE,
 		JLR_TP,
-		AUIPC1,
-		AUIPC2,
+		AUIPC,
 	};
 
 	static constexpr uint8_t OPCODE_I = 0b0010011;
@@ -168,20 +234,27 @@ private:
 	static constexpr uint8_t OPC_JALR = 0b1100111;
 	static constexpr uint8_t OP_AUIPC = 0b0010111;
 
-	ControlState state = ControlState::FETCH1;
+	static constexpr uint8_t F3_LB = 0;
+	static constexpr uint8_t F3_LH = 1;
+	static constexpr uint8_t F3_LW = 2;
+	static constexpr uint8_t F3_LBU = 4;
+	static constexpr uint8_t F3_LHU = 5;
 
-	template<size_t N> uint32_t sign_extend(uint32_t x) {
-		union {
-			uint32_t uimm : N;
-			int32_t imm : N;
-		} s;
+	static constexpr uint8_t F3_SB = 0;
+	static constexpr uint8_t F3_SH = 1;
+	static constexpr uint8_t F3_SW = 2;
 
-		s.uimm = x;
-		int32_t sign_extended = s.imm;
-		return sign_extended;
-	}
+	ControlState state = ControlState::FETCH;
+
+	const MMU& mmu_link;
+	PC& pc_link;
+	IR& ir_link;
+	RegisterFile& rf_link;
+	ALU& alu_link;
 
 public:
+	ControlUnit(const MMU& mmu, PC& pc, IR& ir, RegisterFile& rf, ALU& alu) : mmu_link{mmu}, pc_link {pc}, ir_link{ir}, rf_link{rf}, alu_link{alu} {}
+
 	ControlContext Cycle(uint32_t instruction, bool nreset) {
 		const uint8_t opcode = instruction & 0x7F;
 		const uint8_t funct3 = (instruction >> 12) & 0x7;
@@ -193,6 +266,7 @@ public:
 		const uint16_t imm_s_12 =
 			(((instruction >> 25) & 0x7F) << 5)
 			| ((instruction >> 7) & 0x1F);
+
 		const uint16_t imm_b_13 =
 			(((instruction >> 31) & 1) << 12)
 			| (((instruction >> 7) & 1) << 11)
@@ -211,130 +285,58 @@ public:
 		ControlState next_state = state;
 
 		if (!nreset) {
-			state = ControlState::FETCH1;
+			pc_link.Reset();
+			state = ControlState::FETCH;
 			return context;
 		}
 
 		switch (state) {
-		case ControlState::FETCH1: next_state = ControlState::FETCH2; break;
-		case ControlState::FETCH2: next_state = ControlState::DECODE; break;
+		case ControlState::FETCH: next_state = ControlState::DECODE; break;
 		case ControlState::DECODE:
 			switch (opcode) {
 			case OPCODE_I: next_state = ControlState::I_TYPE; break;
 			case OPCODE_R: next_state = ControlState::R_TYPE; break;
 			case OPCODE_U: next_state = ControlState::U_TYPE; break;
-			case OPCODE_L: next_state = ControlState::LOAD1; break;
+			case OPCODE_L: next_state = ControlState::LOAD; break;
 			case OPCODE_S: next_state = ControlState::S_TYPE; break;
 			case OP_BREAK: next_state = ControlState::BREAK; break;
 			case OPCODE_B: next_state = ControlState::B_TYPE; break;
 			case OPCODE_J: next_state = ControlState::J_TYPE; break;
 			case OPC_JALR: next_state = ControlState::JLR_TP; break;
-			case OP_AUIPC: next_state = ControlState::AUIPC1; break;
+			case OP_AUIPC: next_state = ControlState::AUIPC; break;
 			default: next_state = ControlState::BREAK;
 			}
 			break;
 		case ControlState::BREAK: next_state = ControlState::BREAK;	break;
-		case ControlState::LOAD1: next_state = ControlState::LOAD2;	break;
 		case ControlState::I_TYPE:
 		case ControlState::R_TYPE:
 		case ControlState::U_TYPE:
-		case ControlState::AUIPC2:
-			next_state = ControlState::FETCH2;
-			break;
 		case ControlState::B_TYPE:
 		case ControlState::J_TYPE:
 		case ControlState::JLR_TP:
-		case ControlState::LOAD2:
+		case ControlState::LOAD:
 		case ControlState::S_TYPE:
-			next_state = ControlState::FETCH1;
+		case ControlState::AUIPC:
+			next_state = ControlState::FETCH;
 			break;
-		case ControlState::AUIPC1: next_state = ControlState::AUIPC2; break;
 		default:
 			next_state = ControlState::BREAK;
 		}
 
-		switch (state) {
-		case ControlState::FETCH1: break;
-		case ControlState::FETCH2:
-			context.ir_enable = true;
-			context.pc_enable = true;
-			break;
-		case ControlState::DECODE: break;
-		case ControlState::I_TYPE: {
-			context.immediate = sign_extend<12>(imm12);
-			context.rf_write_enable = true;
-			break;
-		}
-		case ControlState::R_TYPE:
-			context.rf_write_enable = true;
-			context.select_b = true;
-			break;
-		case ControlState::U_TYPE:
-			context.immediate = imm_u_20 << 12;
-			context.rf_write_enable = true;
-			context.select_immediate = true;
-			break;
-		case ControlState::LOAD1:
-			context.immediate = sign_extend<12>(imm12);
-			context.select_addr = true;
-			break;
-		case ControlState::LOAD2:
-			context.rf_write_enable = true;
-			context.immediate = sign_extend<12>(imm12);
-			context.select_addr = true;
-			context.select_mem = true;
-			break;
-		case ControlState::S_TYPE:
-			context.immediate = sign_extend<12>(imm_s_12);
-			context.select_addr = true;
-			context.write_enable = true;
-			break;
-		case ControlState::B_TYPE:
-			context.immediate = sign_extend<13>(imm_b_13);
-			context.branch_op = true;
-			context.pc_add_immediate = true;
-			context.pc_select_pc_base = true;
-			context.select_b = true;
-			break;
-		case ControlState::J_TYPE:
-			context.immediate = sign_extend<21>(imm_j_21);
-			context.rf_write_enable = true;
-			context.pc_enable = true;
-			context.pc_add_immediate = true;
-			context.pc_select_pc_base = true;
-			context.select_pc = true;
-			break;
-		case ControlState::JLR_TP:
-			context.immediate = sign_extend<12>(imm12);
-			context.rf_write_enable = true;
-			context.pc_enable = true;
-			context.pc_select_alu = true;
-			context.select_pc = true;
-			break;
-		case ControlState::AUIPC1:
-			context.immediate = imm_u_20 << 12;
-			context.pc_select_pc_base = true;
-			context.pc_add_immediate = true;
-			context.pc_peek = true;
-			break;
-		case ControlState::AUIPC2:
-			context.rf_write_enable = true;
-			context.select_pc = true;
-			context.select_pc_peek = true;
-		}
+		uint32_t alu_op = 0;
 
 		switch (opcode) {
 		case OPCODE_I:
 		case OPCODE_R: {
 			if (funct3 == 0) {
 				static constexpr uint8_t SUB_F7 = 0x20;
-				context.alu_op = (funct7 == SUB_F7 && opcode == OPCODE_R) ? 0x8 : 0;
+				alu_op = (funct7 == SUB_F7 && opcode == OPCODE_R) ? 0x8 : 0;
 			}
 			else if (!(funct3 & 0x4) && (funct3 & 0x2)) {
-				context.alu_op = (0x7 << 2) | ((funct3 & 1) << 1) | 0;
+				alu_op = (0x7 << 2) | ((funct3 & 1) << 1) | 0;
 			}
 			else {
-				context.alu_op =
+				alu_op =
 					(1 << 5)
 					| ((~(funct3 >> 1) & funct3 & 1) << 4)
 					| ((funct3 == 0x5 && funct7 == 0x20) ? 0x8 : 0)
@@ -346,10 +348,70 @@ public:
 		case OPCODE_S:
 		case OPC_JALR:
 		case OP_AUIPC:
-			context.alu_op = 0;
+			alu_op = 0;
 			break;
 		case OPCODE_B:
-			context.alu_op = (0x3 << 3) | funct3;
+			alu_op = (0x3 << 3) | funct3;
+		}
+
+		switch (state) {
+		case ControlState::FETCH:
+			ir_link.Update(mmu_link.Access(pc_link.Read(), 0, ram_op_t::READ32));
+			pc_link.Update(false, false, 0);
+			break;
+		case ControlState::DECODE:
+			break;
+		case ControlState::I_TYPE:
+			rf_link.Update(rd, alu_link.Execute(rf_link.Read(rs1), sign_extend<12>(imm12), alu_op));
+			break;
+		case ControlState::R_TYPE:
+			rf_link.Update(rd, alu_link.Execute(rf_link.Read(rs1), rf_link.Read(rs2), alu_op));
+			break;
+		case ControlState::U_TYPE:
+			rf_link.Update(rd, imm_u_20 << 12);
+			break;
+		case ControlState::LOAD:
+			context.immediate = sign_extend<12>(imm12);
+			context.fast_mem_addr = context.immediate + rf_link.Read(rs1);
+			switch (funct3) {
+			case F3_LB: context.ram_op = ram_op_t::SREAD8; break;
+			case F3_LH: context.ram_op = ram_op_t::SREAD16; break;
+			case F3_LW: context.ram_op = ram_op_t::READ32; break;
+			case F3_LBU: context.ram_op = ram_op_t::ZREAD8; break;
+			case F3_LHU: context.ram_op = ram_op_t::ZREAD16; break;
+			}
+			rf_link.Update(rd, mmu_link.Access(context.fast_mem_addr, 0, context.ram_op));
+			break;
+		case ControlState::S_TYPE:
+			context.immediate = sign_extend<12>(imm_s_12);
+			context.fast_mem_addr = context.immediate + rf_link.Read(rs1);
+			switch (funct3) {
+			case F3_SB: context.ram_op = ram_op_t::WRITE8; break;
+			case F3_SH: context.ram_op = ram_op_t::WRITE16; break;
+			case F3_SW: context.ram_op = ram_op_t::WRITE32; break;
+			}
+			mmu_link.Access(context.fast_mem_addr, rf_link.Read(rs2), context.ram_op);
+			break;
+		case ControlState::B_TYPE:
+			if (alu_link.Execute(rf_link.Read(rs1), rf_link.Read(rs2), context.alu_op) & 1) {
+				pc_link.Update(true, true, sign_extend<13>(imm_b_13));
+			}			
+			break;
+		case ControlState::J_TYPE: {
+			uint32_t x = pc_link.Read();
+			pc_link.Update(true, true, sign_extend<21>(imm_j_21));
+			rf_link.Update(rd, x);
+			break;
+		}
+		case ControlState::JLR_TP: {
+			uint32_t x = pc_link.Read();
+			pc_link.UpdateALU(alu_link.Execute(rf_link.Read(rs1), sign_extend<12>(imm12), context.alu_op));
+			rf_link.Update(rd, x);
+			break;
+		}
+		case ControlState::AUIPC:
+			rf_link.Update(rd, pc_link.Peek(true, true, imm_u_20 << 12));
+			break;
 		}
 
 		state = next_state;
@@ -358,71 +420,6 @@ public:
 
 	void DumpState() {
 		printf("IS: %02x\n", (int)state);
-	}
-};
-
-class IR {
-private:
-	uint32_t Q = 0;
-
-public:
-	uint32_t Read() const {
-		return Q;
-	}
-
-	void Cycle(bool enable, uint32_t D) {
-		if (enable) {
-			Q = D;
-		}
-	}
-};
-
-class PC {
-private:
-	static constexpr uint32_t RESET_VECTOR = 0x80000000;
-
-	uint32_t base = RESET_VECTOR;
-	uint32_t peek_base = 0;
-
-public:
-	uint32_t Read() const {
-		return base;
-	}
-
-	uint32_t Peek() const {
-		return peek_base;
-	}
-
-	void Cycle(bool nreset, ControlContext context, uint32_t immediate, uint32_t alu_input) {
-		if (!nreset) {
-			base = RESET_VECTOR;
-		}
-		else if (context.pc_peek || context.pc_enable || (context.branch_op && (alu_input & 1))) {
-			uint32_t next_base = base;
-
-			if (context.pc_select_alu) {
-				next_base = alu_input & 0xFFFFFFFC;
-			}
-			else {
-				if (context.pc_select_pc_base) {
-					next_base -= 4;
-				}
-
-				if (context.pc_add_immediate) {
-					next_base += immediate;
-				}
-				else {
-					next_base += 4;
-				}
-			}
-
-			if (context.pc_peek) {
-				peek_base = next_base;
-			}
-			else {
-				base = next_base;
-			}
-		}
 	}
 };
 
@@ -516,18 +513,6 @@ private:
 	CSR32 mie = CSR32(mie_mask, mie_reset_value);
 };
 
-class MMU {
-public:
-	virtual uint32_t Read(uint32_t at) const = 0;
-	virtual void Write(uint32_t at, uint32_t v) const = 0;
-};
-
-struct ExecutionContext {
-	uint32_t address;
-	uint32_t write_data;
-	bool write_enable;
-};
-
 class ExecutionUnit {
 private:
 	IR ir;
@@ -542,58 +527,26 @@ private:
 	PC pc;
 
 public:
-	ExecutionContext Cycle(bool nreset, uint32_t rdata) {
+	ExecutionUnit(const MMU& mmu) : cu{mmu, pc, ir, rf, alu} {}
+
+	void Cycle(bool nreset) {
 		uint32_t instruction = ir.Read();
-
-		// Read registers
-		uint32_t ra = rf.Read((instruction >> 15) & 0x1F);
-		uint32_t rb = rf.Read((instruction >> 20) & 0x1F);
-
-		// Read next pc
-		uint32_t next_pc = context.select_pc_peek ? pc.Peek() : pc.Read();
-
-		// select immediate or register B
-		uint32_t sel_b = context.select_b ? rb : context.immediate;
-
-		// execute ALU
-		uint32_t alu_res = alu.Execute(ra, sel_b, context.alu_op);
-
-		// select alu result or immediate
-		uint32_t alu_mux = context.select_immediate ? context.immediate : alu_res;
-
-		// select next pc or memory data
-		uint32_t pc_mux = context.select_mem ? rdata : next_pc;
-
-		// final write back data mux
-		uint32_t final_mux = (context.select_pc || context.select_mem) ? pc_mux : alu_mux;
-
-		// memory address mux
-		uint32_t write_data = rb;
-		bool write_enable = context.write_enable;
-
-		pc.Cycle(nreset, context, context.immediate, alu_res);
-		rf.Cycle((instruction >> 7) & 0x1F, context.rf_write_enable, final_mux);
 		context = cu.Cycle(instruction, nreset);
-		ir.Cycle(context.ir_enable, rdata);
-
-		uint32_t addr_mux = context.select_addr ? alu_res : pc.Read();
-
-		return ExecutionContext{
-			.address = addr_mux,
-			.write_data = rf.Read((instruction >> 20) & 0x1F),
-			.write_enable = context.write_enable
-		};
 	}
 
 	void DumpState() {
-		for (size_t i = 0; i < 32 / 4; ++i) {
-			for (size_t j = 0; j < 4; ++j) {
+		for (uint8_t i = 0; i < 32 / 4; ++i) {
+			for (uint8_t j = 0; j < 4; ++j) {
 				printf("x%02d: %08x ", (uint32_t)(i * 4 + j), rf.Read(i * 4 + j));
 			}
 			puts("");
 		}
-		printf("IR: %08x PC: %08x PE: %01x WE: %01x\n", ir.Read(), pc.Read(), context.pc_enable, context.rf_write_enable);
+		printf("IR: %08x PC: %08x\n", ir.Read(), pc.Read());
 		cu.DumpState();
+	}
+
+	uint32_t QueryInstructionCounter() const {
+		return ir.QueryCount();
 	}
 };
 
@@ -602,28 +555,29 @@ private:
 	const MMU& mmu;
 
 	ExecutionUnit eu;
-	ExecutionContext context;
 
 	uint32_t cycle = 0;
 	time_t start_time = time(0);
 
 public:
-	CPU(const MMU& mmu) : mmu{mmu} {
-		context = eu.Cycle(false, 0);
+	CPU(const MMU& mmu) : mmu{mmu}, eu{mmu} {
+		eu.Cycle(false);
 	};
 
 	void Cycle() {
-		if (context.write_enable) {
-			mmu.Write(context.address, context.write_data);
-		}
-
-		uint32_t rdata = mmu.Read(context.address);
-		context = eu.Cycle(true, rdata);
+		eu.Cycle(true);
 		++cycle;
 	}
 
 	void DumpState() {
-		printf("CPU Cycle: %08x CPU Speed: %08d Hz\n", cycle, (int)(cycle / difftime(time(0), start_time)));
+		const auto icount = eu.QueryInstructionCounter();
+		printf(
+			"CPU Cycle: %08x Instruction: %08x CPU Speed: %08d Hz | %08d i/s\n",
+			cycle,
+			icount,
+			(int)(cycle / difftime(time(0), start_time)),
+			(int)(icount / difftime(time(0), start_time))
+		);
 		eu.DumpState();
 	}
 };
@@ -635,7 +589,7 @@ private:
 
 public:
 	RAM(size_t limit) : limit{limit} {
-		ram = new uint8_t[limit];
+		ram = new uint8_t[limit]{ 0 };
 	}
 
 	uint32_t Read(uint32_t at) const {
@@ -686,12 +640,7 @@ private:
 	RAM ram;
 	VROM firmware;
 
-public:
-	BasicMMU(std::ifstream& firmware) : ram{RAM_LIMIT}, firmware{firmware} {}
-
 	virtual uint32_t Read(uint32_t at) const final {
-		at -= at % 4;
-
 		if (at >= RAM_BASE && at < RAM_BASE + RAM_LIMIT) {
 			return ram.Read(at - RAM_BASE);
 		}
@@ -704,13 +653,35 @@ public:
 	}
 	
 	virtual void Write(uint32_t at, uint32_t x) const final {
-		at -= at % 4;
-
 		if (at >= RAM_BASE && at < RAM_BASE + RAM_LIMIT) {
 			ram.Write(at - RAM_BASE, x);
 		}
 		else if (at == GTEXT_BASE) {
 			std::cout << (char)x << std::endl;
+		}
+	}
+
+public:
+	BasicMMU(std::ifstream& firmware) : ram{ RAM_LIMIT }, firmware{ firmware } {}
+
+	uint32_t Access(uint32_t at, uint32_t x, ram_op_t op) const final {
+		const uint32_t disp = (at % sizeof(uint32_t));
+		const uint32_t disp8 = disp * 8;
+		const uint32_t disp16 = (disp8 / 16) * 16;
+		const uint32_t effective_at = at - disp;
+
+		const uint32_t rd = Read(effective_at);
+
+		switch (op) {
+		case ram_op_t::SREAD8: return sign_extend<8>(rd >> disp8);
+		case ram_op_t::ZREAD8: return (rd >> disp8) & 0xFF;
+		case ram_op_t::SREAD16: return sign_extend<16>(rd >> disp16);
+		case ram_op_t::ZREAD16: return (rd >> disp16) & 0xFFFF;
+		case ram_op_t::READ32: return rd;
+		case ram_op_t::WRITE8: Write(effective_at, (rd & ~(0xFF << disp8)) | ((x & 0xFF) << disp8)); return rd;
+		case ram_op_t::WRITE16: Write(effective_at, (rd & ~(0xFFFF << disp16)) | ((x & 0xFFFF) << disp16)); return rd;
+		case ram_op_t::WRITE32: Write(effective_at, x); return rd;
+		default: return rd;
 		}
 	}
 };
