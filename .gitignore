@@ -2,3 +2,4 @@
 out
 CMakePresets.json
 tests/*.bin
+tests/*.bin.bak
